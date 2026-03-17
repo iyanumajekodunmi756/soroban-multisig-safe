@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: stellar-multisig-postgres
+    environment:
+      POSTGRES_DB: multisig_safe
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/prisma/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - multisig-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: stellar-multisig-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - multisig-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stellar-multisig-backend
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/multisig_safe
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: your-super-secret-jwt-key-here
+      STELLAR_NETWORK: futurenet
+      STELLAR_RPC_URL: https://rpc.fUTUREnet.stellar.org:443
+      STELLAR_HORIZON_URL: https://horizon-futurenet.stellar.org
+      FRONTEND_URL: http://localhost:3000
+    ports:
+      - "5001:5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - multisig-network
+    volumes:
+      - ./backend/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: stellar-multisig-frontend
+    environment:
+      NODE_ENV: production
+      REACT_APP_API_URL: http://localhost:5001/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - multisig-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Stellar Quickstart (for local development)
+  stellar:
+    image: stellar/quickstart:latest
+    container_name: stellar-multisig-stellar
+    environment:
+      - STELLAR_NETWORK=testnet
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8002:8002"
+      - "8003:8003"
+      - "8004:8004"
+      - "8005:8005"
+      - "8006:8006"
+      - "8007:8007"
+      - "8008:8008"
+      - "8009:8009"
+      - "8010:8010"
+      - "8011:8011"
+      - "8012:8012"
+      - "8013:8013"
+      - "8014:8014"
+      - "8015:8015"
+    networks:
+      - multisig-network
+    profiles:
+      - development
+
+  # Nginx Reverse Proxy (for production)
+  nginx:
+    image: nginx:alpine
+    container_name: stellar-multisig-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - multisig-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  multisig-network:
+    driver: bridge
