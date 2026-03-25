@@ -82,15 +82,33 @@ model Transaction {
   data         String?  // Hex string for transaction data
   executed     Boolean  @default(false)
   signatures   Int      @default(0)
+  title        String?  // Off-chain metadata: Title
+  description  String?  // Off-chain metadata: Description
+  isDeleted    Boolean  @default(false) // Soft-delete functionality
   createdAt    DateTime @default(now())
   expiresAt    DateTime
   executedAt   DateTime?
 
   // Relations
   wallet     Wallet      @relation(fields: [walletId], references: [id], onDelete: Cascade)
-  signatures Signature[]
+  signatures_rel Signature[] @relation("TransactionSignatures")
+  comments    Comment[]
 
   @@map("transactions")
+}
+
+model Comment {
+  id            String   @id @default(cuid())
+  transactionId String
+  userId        String
+  content       String   // Discussion/Comments
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("comments")
 }
 
 model Signature {
@@ -100,7 +118,7 @@ model Signature {
   signerAddress String
   signedAt      DateTime @default(now())
 
-  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade, name: "TransactionSignatures")
   user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([transactionId, userId])
