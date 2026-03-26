@@ -49,6 +49,12 @@ pub enum MultisigError {
     InvalidWasmHash = 19,
     /// Upgrade already in progress
     UpgradeInProgress = 20,
+    /// Wallet is currently frozen
+    WalletFrozen = 21,
+    /// Freeze period has not expired
+    FreezePeriodNotExpired = 22,
+    /// Invalid freeze duration
+    InvalidFreezeDuration = 23,
 }
 
 #[contracttype]
@@ -80,6 +86,23 @@ pub struct UpgradeEvent {
     pub upgraded_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreezeEvent {
+    pub frozen_by: Address,
+    pub frozen_at: u64,
+    pub freeze_duration: u64,
+    pub reason: Bytes,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnfreezeEvent {
+    pub unfrozen_by: Address,
+    pub unfrozen_at: u64,
+    pub reason: Bytes,
+}
+
 // Storage keys
 const OWNERS: Symbol = symbol_short!("OWNERS");
 const THRESHOLD: Symbol = symbol_short!("THRESHLD");
@@ -94,9 +117,14 @@ const LAST_TTL_EXTENSION: Symbol = symbol_short!("LAST_EXT");
 const PERSISTENT_DATA: Symbol = symbol_short!("PERS_DATA");
 const CONTRACT_VERSION: Symbol = symbol_short!("VERSION");
 const UPGRADE_STATE: Symbol = symbol_short!("UPG_STATE");
+const IS_FROZEN: Symbol = symbol_short!("IS_FROZEN");
+const FREEZE_UNTIL: Symbol = symbol_short!("FREEZE_UNTIL");
+const FREEZE_REASON: Symbol = symbol_short!("FREEZE_RSN");
 
 // Event topics
 const UPGRADE_EVENT: Symbol = symbol_short!("UPGRADE");
+const FREEZE_EVENT: Symbol = symbol_short!("FREEZE");
+const UNFREEZE_EVENT: Symbol = symbol_short!("UNFREEZE");
 
 // Constants for TTL management
 const DEFAULT_INSTANCE_TTL: u32 = 15552000; // 180 days in ledgers
@@ -106,6 +134,9 @@ const RENT_BUFFER_MULTIPLIER: u32 = 2; // 2x buffer for safety
 const MAX_OWNERS: u32 = 10;
 const MIN_RECOVERY_DELAY: u64 = 86400; // 24 hours in seconds
 const CURRENT_VERSION: u32 = 1; // Current contract version
+const MIN_FREEZE_DURATION: u64 = 3600; // 1 hour in seconds
+const MAX_FREEZE_DURATION: u64 = 2592000; // 30 days in seconds
+const FREEZE_THRESHOLD_RATIO: u32 = 3; // Freeze requires 1/3 of normal threshold
 
 #[contract]
 pub struct MultisigSafe;
@@ -158,6 +189,11 @@ impl MultisigSafe {
         // Set contract version for migration tracking
         env.storage().instance().set(&CONTRACT_VERSION, &CURRENT_VERSION);
 
+        // Initialize freeze state
+        env.storage().instance().set(&IS_FROZEN, &false);
+        env.storage().instance().set(&FREEZE_UNTIL, &0u64);
+        env.storage().instance().set(&FREEZE_REASON, &Bytes::new(&env));
+
         // Set initial TTL for instance storage
         Self::extend_instance_ttl(&env, DEFAULT_INSTANCE_TTL)?;
 
@@ -175,6 +211,9 @@ impl MultisigSafe {
     ) -> Result<u64, MultisigError> {
         caller.require_auth();
         Self::require_owner(&env, &caller)?;
+        
+        // Check if wallet is frozen
+        Self::check_frozen_status(&env)?;
         
         // Auto-extend instance TTL
         Self::auto_extend_instance_ttl(&env)?;
@@ -208,6 +247,9 @@ impl MultisigSafe {
     pub fn sign_transaction(env: Env, caller: Address, transaction_id: u64) -> Result<(), MultisigError> {
         caller.require_auth();
         Self::require_owner(&env, &caller)?;
+        
+        // Check if wallet is frozen
+        Self::check_frozen_status(&env)?;
         
         // Auto-extend instance TTL
         Self::auto_extend_instance_ttl(&env)?;
@@ -442,6 +484,7 @@ impl MultisigSafe {
     }
 
     /// Emergency recovery by recovery address
+    /// Bypasses freeze checks - recovery should work even if wallet is frozen
     pub fn emergency_recovery(
         env: Env,
         caller: Address,
@@ -473,7 +516,273 @@ impl MultisigSafe {
         // Clear any ongoing recovery
         env.storage().instance().remove(&RECOVERY_REQUEST);
 
+        // Auto-unfreeze wallet after successful recovery for safety
+        let current_time = env.ledger().timestamp();
+        env.storage().instance().set(&IS_FROZEN, &false);
+        env.storage().instance().set(&FREEZE_UNTIL, &0u64);
+        env.storage().instance().set(&FREEZE_REASON, &Bytes::from_slice(&env, b"Auto-unfreeze: recovery executed"));
+
+        // Emit recovery unfreeze event
+        let unfreeze_event = UnfreezeEvent {
+            unfrozen_by: caller.clone(),
+            unfrozen_at: current_time,
+            reason: Bytes::from_slice(&env, b"Auto-unfreeze: recovery executed"),
+        };
+
+        env.events().publish(
+            (UNFREEZE_EVENT, symbol_short!("RECOVERY")),
+            unfreeze_event,
+        );
+
         Ok(())
+    }
+
+    /// Freeze the wallet with lower threshold requirement
+    /// Requires 1/3 of normal threshold for emergency situations
+    pub fn freeze_wallet(
+        env: Env,
+        caller: Address,
+        duration_seconds: u64,
+        reason: Bytes,
+    ) -> Result<(), MultisigError> {
+        caller.require_auth();
+        Self::require_owner(&env, &caller)?;
+
+        // Validate freeze duration
+        if duration_seconds < MIN_FREEZE_DURATION || duration_seconds > MAX_FREEZE_DURATION {
+            return Err(MultisigError::InvalidFreezeDuration);
+        }
+
+        let current_time = env.ledger().timestamp();
+        let freeze_until = current_time + duration_seconds;
+
+        // Check if already frozen and extend if needed
+        let is_frozen: bool = env.storage().instance().get(&IS_FROZEN).unwrap_or(false);
+        let current_freeze_until: u64 = env.storage().instance().get(&FREEZE_UNTIL).unwrap_or(0);
+
+        if is_frozen && current_freeze_until > current_time {
+            // Extend existing freeze
+            if freeze_until <= current_freeze_until {
+                return Err(MultisigError::FreezePeriodNotExpired);
+            }
+        }
+
+        // Get normal threshold and calculate freeze threshold (1/3)
+        let normal_threshold: u32 = env.storage().instance().get(&THRESHOLD).unwrap();
+        let freeze_threshold = (normal_threshold + FREEZE_THRESHOLD_RATIO - 1) / FREEZE_THRESHOLD_RATIO;
+        let freeze_threshold = freeze_threshold.max(1); // At least 1 signature required
+
+        // Create freeze transaction ID
+        let freeze_tx_id = env.ledger().sequence();
+        let freeze_key = (FREEZE_EVENT, freeze_tx_id, caller.clone());
+
+        // Check if this owner has already signed this freeze request
+        if env.storage().instance().has(&freeze_key) {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Add signature for this freeze request
+        env.storage().instance().set(&freeze_key, &true);
+
+        // Count signatures for this freeze request
+        let owners: Vec<Address> = env.storage().instance().get(&OWNERS)
+            .ok_or(MultisigError::OwnerDoesNotExist)?;
+        let mut signature_count = 0u32;
+        for owner in &owners {
+            let owner_freeze_key = (FREEZE_EVENT, freeze_tx_id, owner);
+            if env.storage().instance().has(&owner_freeze_key) {
+                signature_count += 1;
+            }
+        }
+
+        // Check if we have enough signatures for freeze
+        if signature_count < freeze_threshold {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Execute freeze
+        env.storage().instance().set(&IS_FROZEN, &true);
+        env.storage().instance().set(&FREEZE_UNTIL, &freeze_until);
+        env.storage().instance().set(&FREEZE_REASON, &reason.clone());
+
+        // Emit freeze event
+        let freeze_event = FreezeEvent {
+            frozen_by: caller.clone(),
+            frozen_at: current_time,
+            freeze_duration: duration_seconds,
+            reason: reason.clone(),
+        };
+
+        env.events().publish(
+            (FREEZE_EVENT, symbol_short!("EXECUTED")),
+            freeze_event,
+        );
+
+        // Clean up freeze signatures
+        for owner in &owners {
+            let owner_freeze_key = (FREEZE_EVENT, freeze_tx_id, owner);
+            env.storage().instance().remove(&owner_freeze_key);
+        }
+
+        Ok(())
+    }
+
+    /// Unfreeze the wallet with high threshold (all owners)
+    pub fn unfreeze_wallet(
+        env: Env,
+        caller: Address,
+        reason: Bytes,
+    ) -> Result<(), MultisigError> {
+        caller.require_auth();
+        Self::require_owner(&env, &caller)?;
+
+        let current_time = env.ledger().timestamp();
+        let is_frozen: bool = env.storage().instance().get(&IS_FROZEN).unwrap_or(false);
+        let freeze_until: u64 = env.storage().instance().get(&FREEZE_UNTIL).unwrap_or(0);
+
+        // Check if wallet is actually frozen
+        if !is_frozen {
+            return Err(MultisigError::WalletFrozen); // Using existing error for consistency
+        }
+
+        // Check if freeze period has expired (auto-unfreeze)
+        if current_time >= freeze_until {
+            Self::auto_unfreeze(&env)?;
+            return Ok(());
+        }
+
+        // Get all owners - high threshold means all must approve
+        let owners: Vec<Address> = env.storage().instance().get(&OWNERS)
+            .ok_or(MultisigError::OwnerDoesNotExist)?;
+        let high_threshold = owners.len() as u32;
+
+        // Create unfreeze transaction ID
+        let unfreeze_tx_id = env.ledger().sequence();
+        let unfreeze_key = (UNFREEZE_EVENT, unfreeze_tx_id, caller.clone());
+
+        // Check if this owner has already signed this unfreeze request
+        if env.storage().instance().has(&unfreeze_key) {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Add signature for this unfreeze request
+        env.storage().instance().set(&unfreeze_key, &true);
+
+        // Count signatures for this unfreeze request
+        let mut signature_count = 0u32;
+        for owner in &owners {
+            let owner_unfreeze_key = (UNFREEZE_EVENT, unfreeze_tx_id, owner);
+            if env.storage().instance().has(&owner_unfreeze_key) {
+                signature_count += 1;
+            }
+        }
+
+        // Check if we have enough signatures for unfreeze (all owners)
+        if signature_count < high_threshold {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Execute unfreeze
+        env.storage().instance().set(&IS_FROZEN, &false);
+        env.storage().instance().set(&FREEZE_UNTIL, &0u64);
+        env.storage().instance().set(&FREEZE_REASON, &Bytes::new(&env));
+
+        // Emit unfreeze event
+        let unfreeze_event = UnfreezeEvent {
+            unfrozen_by: caller.clone(),
+            unfrozen_at: current_time,
+            reason: reason.clone(),
+        };
+
+        env.events().publish(
+            (UNFREEZE_EVENT, symbol_short!("EXECUTED")),
+            unfreeze_event,
+        );
+
+        // Clean up unfreeze signatures
+        for owner in &owners {
+            let owner_unfreeze_key = (UNFREEZE_EVENT, unfreeze_tx_id, owner);
+            env.storage().instance().remove(&owner_unfreeze_key);
+        }
+
+        Ok(())
+    }
+
+    /// Check if wallet is frozen and auto-unfreeze if period expired
+    fn check_frozen_status(env: &Env) -> Result<(), MultisigError> {
+        let is_frozen: bool = env.storage().instance().get(&IS_FROZEN).unwrap_or(false);
+        
+        if !is_frozen {
+            return Ok(());
+        }
+
+        let current_time = env.ledger().timestamp();
+        let freeze_until: u64 = env.storage().instance().get(&FREEZE_UNTIL).unwrap_or(0);
+
+        // Auto-unfreeze if period has expired
+        if current_time >= freeze_until {
+            Self::auto_unfreeze(env)?;
+            return Ok(());
+        }
+
+        Err(MultisigError::WalletFrozen)
+    }
+
+    /// Auto-unfreeze when freeze period expires
+    fn auto_unfreeze(env: &Env) -> Result<(), MultisigError> {
+        let current_time = env.ledger().timestamp();
+        let freeze_reason: Bytes = env.storage().instance().get(&FREEZE_REASON).unwrap_or_default();
+
+        env.storage().instance().set(&IS_FROZEN, &false);
+        env.storage().instance().set(&FREEZE_UNTIL, &0u64);
+        env.storage().instance().set(&FREEZE_REASON, &Bytes::new(env));
+
+        // Emit auto-unfreeze event
+        let unfreeze_event = UnfreezeEvent {
+            unfrozen_by: env.current_contract_address(),
+            unfrozen_at: current_time,
+            reason: Bytes::from_slice(env, b"Auto-unfreeze: period expired"),
+        };
+
+        env.events().publish(
+            (UNFREEZE_EVENT, symbol_short!("AUTO")),
+            unfreeze_event,
+        );
+
+        Ok(())
+    }
+
+    /// Get current freeze status
+    pub fn get_freeze_status(env: Env) -> Result<(bool, u64, Bytes), MultisigError> {
+        // Auto-extend instance TTL
+        Self::auto_extend_instance_ttl(&env)?;
+        
+        let is_frozen: bool = env.storage().instance().get(&IS_FROZEN).unwrap_or(false);
+        let freeze_until: u64 = env.storage().instance().get(&FREEZE_UNTIL).unwrap_or(0);
+        let freeze_reason: Bytes = env.storage().instance().get(&FREEZE_REASON).unwrap_or_default();
+
+        // Check if auto-unfreeze should happen
+        if is_frozen {
+            let current_time = env.ledger().timestamp();
+            if current_time >= freeze_until {
+                Self::auto_unfreeze(&env)?;
+                return Ok((false, 0, Bytes::new(&env)));
+            }
+        }
+
+        Ok((is_frozen, freeze_until, freeze_reason))
+    }
+
+    /// Helper function to check if an owner has signed a specific freeze request
+    pub fn has_signed_freeze(env: Env, freeze_tx_id: u64, owner: Address) -> Result<bool, MultisigError> {
+        let freeze_key = (FREEZE_EVENT, freeze_tx_id, owner);
+        Ok(env.storage().instance().has(&freeze_key))
+    }
+
+    /// Helper function to check if an owner has signed a specific unfreeze request
+    pub fn has_signed_unfreeze(env: Env, unfreeze_tx_id: u64, owner: Address) -> Result<bool, MultisigError> {
+        let unfreeze_key = (UNFREEZE_EVENT, unfreeze_tx_id, owner);
+        Ok(env.storage().instance().has(&unfreeze_key))
     }
 
     /// Upgrade the contract to a new WASM hash
