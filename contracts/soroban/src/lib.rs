@@ -45,6 +45,10 @@ pub enum MultisigError {
     InsufficientBalanceForRent = 17,
     /// Invalid TTL extension
     InvalidTtlExtension = 18,
+    /// Invalid WASM hash
+    InvalidWasmHash = 19,
+    /// Upgrade already in progress
+    UpgradeInProgress = 20,
 }
 
 #[contracttype]
@@ -67,6 +71,15 @@ pub struct RecoveryRequest {
     pub execute_after: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeEvent {
+    pub old_wasm_hash: Bytes,
+    pub new_wasm_hash: Bytes,
+    pub upgraded_by: Address,
+    pub upgraded_at: u64,
+}
+
 // Storage keys
 const OWNERS: Symbol = symbol_short!("OWNERS");
 const THRESHOLD: Symbol = symbol_short!("THRESHLD");
@@ -79,6 +92,11 @@ const SIGNATURES: Symbol = symbol_short!("SIGS");
 const RENT_BALANCE: Symbol = symbol_short!("RENT_BAL");
 const LAST_TTL_EXTENSION: Symbol = symbol_short!("LAST_EXT");
 const PERSISTENT_DATA: Symbol = symbol_short!("PERS_DATA");
+const CONTRACT_VERSION: Symbol = symbol_short!("VERSION");
+const UPGRADE_STATE: Symbol = symbol_short!("UPG_STATE");
+
+// Event topics
+const UPGRADE_EVENT: Symbol = symbol_short!("UPGRADE");
 
 // Constants for TTL management
 const DEFAULT_INSTANCE_TTL: u32 = 15552000; // 180 days in ledgers
@@ -87,6 +105,7 @@ const MIN_TTL_EXTENSION: u32 = 2592000; // 30 days in ledgers
 const RENT_BUFFER_MULTIPLIER: u32 = 2; // 2x buffer for safety
 const MAX_OWNERS: u32 = 10;
 const MIN_RECOVERY_DELAY: u64 = 86400; // 24 hours in seconds
+const CURRENT_VERSION: u32 = 1; // Current contract version
 
 #[contract]
 pub struct MultisigSafe;
@@ -135,6 +154,9 @@ impl MultisigSafe {
         // Initialize rent balance tracking
         env.storage().instance().set(&RENT_BALANCE, &0i128);
         env.storage().instance().set(&LAST_TTL_EXTENSION, &env.ledger().sequence());
+
+        // Set contract version for migration tracking
+        env.storage().instance().set(&CONTRACT_VERSION, &CURRENT_VERSION);
 
         // Set initial TTL for instance storage
         Self::extend_instance_ttl(&env, DEFAULT_INSTANCE_TTL)?;
@@ -452,6 +474,142 @@ impl MultisigSafe {
         env.storage().instance().remove(&RECOVERY_REQUEST);
 
         Ok(())
+    }
+
+    /// Upgrade the contract to a new WASM hash
+    /// Requires the "High" threshold of signers (all owners)
+    pub fn upgrade(env: Env, caller: Address, new_wasm_hash: Bytes) -> Result<(), MultisigError> {
+        caller.require_auth();
+        Self::require_owner(&env, &caller)?;
+
+        // Check if upgrade is already in progress
+        if env.storage().instance().has(&UPGRADE_STATE) {
+            return Err(MultisigError::UpgradeInProgress);
+        }
+
+        // Validate new WASM hash is not empty
+        if new_wasm_hash.is_empty() {
+            return Err(MultisigError::InvalidWasmHash);
+        }
+
+        // Get current owners and require all of them to sign (High threshold)
+        let owners: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&OWNERS)
+            .ok_or(MultisigError::OwnerDoesNotExist)?;
+
+        // High threshold means all owners must approve
+        let high_threshold = owners.len() as u32;
+
+        // Create a temporary upgrade transaction to collect signatures
+        let upgrade_tx_id = env.ledger().sequence(); // Use ledger sequence as unique ID
+        let upgrade_key = (UPGRADE_EVENT, upgrade_tx_id, caller.clone());
+        
+        // Check if this owner has already signed this upgrade
+        if env.storage().instance().has(&upgrade_key) {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Add signature for this upgrade
+        env.storage().instance().set(&upgrade_key, &true);
+
+        // Count signatures for this upgrade
+        let mut signature_count = 0u32;
+        for owner in &owners {
+            let owner_upgrade_key = (UPGRADE_EVENT, upgrade_tx_id, owner);
+            if env.storage().instance().has(&owner_upgrade_key) {
+                signature_count += 1;
+            }
+        }
+
+        // Check if we have enough signatures (High threshold = all owners)
+        if signature_count < high_threshold {
+            return Err(MultisigError::InsufficientSignatures);
+        }
+
+        // Set upgrade state to prevent concurrent upgrades
+        env.storage().instance().set(&UPGRADE_STATE, &true);
+
+        // Get current WASM hash and version
+        let current_contract_id = env.current_contract_address();
+        let old_wasm_hash = env.deployer().get_current_wasm_hash(&current_contract_id);
+        let current_version: u32 = env.storage().instance().get(&CONTRACT_VERSION).unwrap_or(0);
+
+        // Validate that new WASM hash is different from current
+        if new_wasm_hash == old_wasm_hash {
+            env.storage().instance().remove(&UPGRADE_STATE);
+            return Err(MultisigError::InvalidWasmHash);
+        }
+
+        // Perform data migration before upgrade (if needed)
+        Self::migrate_data(&env, current_version, CURRENT_VERSION)?;
+
+        // Perform the upgrade
+        env.deployer().update_current_contract_wasm(&new_wasm_hash);
+
+        // Update version
+        env.storage().instance().set(&CONTRACT_VERSION, &(CURRENT_VERSION + 1));
+
+        // Emit upgrade event
+        let upgrade_event = UpgradeEvent {
+            old_wasm_hash,
+            new_wasm_hash: new_wasm_hash.clone(),
+            upgraded_by: caller,
+            upgraded_at: env.ledger().timestamp(),
+        };
+
+        env.events().publish(
+            (UPGRADE_EVENT, symbol_short!("EXECUTED")),
+            upgrade_event,
+        );
+
+        // Clean up upgrade signatures and state
+        for owner in &owners {
+            let owner_upgrade_key = (UPGRADE_EVENT, upgrade_tx_id, owner);
+            env.storage().instance().remove(&owner_upgrade_key);
+        }
+        env.storage().instance().remove(&UPGRADE_STATE);
+
+        Ok(())
+    }
+
+    /// Data migration function for version upgrades
+    fn migrate_data(env: &Env, from_version: u32, to_version: u32) -> Result<(), MultisigError> {
+        // For now, no migration needed as we maintain backward compatibility
+        // Future versions can add specific migration logic here
+        
+        // Example migration logic for future versions:
+        // if from_version < 2 && to_version >= 2 {
+        //     // Migrate data format from v1 to v2
+        // }
+        
+        // Ensure all critical data exists and is compatible
+        let owners: Vec<Address> = env.storage().instance().get(&OWNERS)
+            .ok_or(MultisigError::EntryArchived)?;
+        let threshold: u32 = env.storage().instance().get(&THRESHOLD)
+            .ok_or(MultisigError::EntryArchived)?;
+        
+        // Validate data integrity
+        if owners.is_empty() || threshold == 0 || threshold > owners.len() as u32 {
+            return Err(MultisigError::InvalidThreshold);
+        }
+
+        Ok(())
+    }
+
+    /// Helper function to check if an owner has signed a specific upgrade
+    pub fn has_signed_upgrade(env: Env, upgrade_tx_id: u64, owner: Address) -> Result<bool, MultisigError> {
+        let upgrade_key = (UPGRADE_EVENT, upgrade_tx_id, owner);
+        Ok(env.storage().instance().has(&upgrade_key))
+    }
+
+    /// Get current contract version
+    pub fn get_version(env: Env) -> Result<u32, MultisigError> {
+        match env.storage().instance().get(&CONTRACT_VERSION) {
+            Some(version) => Ok(version),
+            None => Ok(0), // Default to version 0 if not set (legacy contracts)
+        }
     }
 
     /// View functions
